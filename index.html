@@ -32,160 +32,111 @@
   /* ── SCROLL VIDEO BACKGROUND ── */
   #scroll-video-bg {
     position: fixed;
-    inset: 0;
+    /* Stretch into safe-area on notched phones */
+    top: env(safe-area-inset-top, 0px);
+    right: env(safe-area-inset-right, 0px);
+    bottom: env(safe-area-inset-bottom, 0px);
+    left: env(safe-area-inset-left, 0px);
+    /* Fallback: stretch to cover even without safe-area support */
+    top: 0; right: 0; bottom: 0; left: 0;
     z-index: 0;
     pointer-events: none;
     overflow: hidden;
     background: var(--dark);
-    box-sizing: border-box;
-    width: 100%;
-    /* Fit real visible area: dvh (modern), vh + fill-available (iOS / legacy) */
-    height: 100vh;
-    min-height: -webkit-fill-available;
-    height: 100dvh;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
-             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   }
 
-  /*
-   * With object-fit:contain, the picture sits mid-screen; viewport-edge masks
-   * never touched its border. Wrapper mask = radial (inward fade) ∩ H ∩ V linears
-   * so alpha eases around the actual frame, not only the screen rim.
-   */
-  #scroll-video-bg .scroll-media-mask-wrap {
+  /* ── VIDEO & IMAGE: FULL-SCREEN COVER ── */
+  #scroll-video-bg video,
+  #scroll-video-bg .hero-static-slide {
     position: absolute;
-    inset: 0;
-    z-index: 0;
-    overflow: hidden;
-    pointer-events: none;
-    -webkit-mask-repeat: no-repeat;
-    -webkit-mask-size: 100% 100%;
-    -webkit-mask-mode: alpha;
-    mask-repeat: no-repeat;
-    mask-size: 100% 100%;
-    mask-mode: alpha;
-    -webkit-mask-image:
-      radial-gradient(
-        ellipse 96% 92% at 50% 50%,
-        #000 0%,
-        #000 18%,
-        rgba(0,0,0,0.94) 30%,
-        rgba(0,0,0,0.72) 44%,
-        rgba(0,0,0,0.38) 58%,
-        rgba(0,0,0,0.12) 72%,
-        transparent 100%
-      ),
-      linear-gradient(
-        to right,
-        transparent 0%,
-        rgba(0,0,0,0.4) 10%,
-        rgba(0,0,0,0.95) 26%,
-        #000 32%,
-        #000 68%,
-        rgba(0,0,0,0.95) 74%,
-        rgba(0,0,0,0.4) 90%,
-        transparent 100%
-      ),
-      linear-gradient(
-        to bottom,
-        transparent 0%,
-        rgba(0,0,0,0.4) 10%,
-        rgba(0,0,0,0.95) 26%,
-        #000 32%,
-        #000 68%,
-        rgba(0,0,0,0.95) 74%,
-        rgba(0,0,0,0.4) 90%,
-        transparent 100%
-      );
-    -webkit-mask-composite: source-in, source-in;
-    mask-image:
-      radial-gradient(
-        ellipse 96% 92% at 50% 50%,
-        #000 0%,
-        #000 18%,
-        rgba(0,0,0,0.94) 30%,
-        rgba(0,0,0,0.72) 44%,
-        rgba(0,0,0,0.38) 58%,
-        rgba(0,0,0,0.12) 72%,
-        transparent 100%
-      ),
-      linear-gradient(
-        to right,
-        transparent 0%,
-        rgba(0,0,0,0.4) 10%,
-        rgba(0,0,0,0.95) 26%,
-        #000 32%,
-        #000 68%,
-        rgba(0,0,0,0.95) 74%,
-        rgba(0,0,0,0.4) 90%,
-        transparent 100%
-      ),
-      linear-gradient(
-        to bottom,
-        transparent 0%,
-        rgba(0,0,0,0.4) 10%,
-        rgba(0,0,0,0.95) 26%,
-        #000 32%,
-        #000 68%,
-        rgba(0,0,0,0.95) 74%,
-        rgba(0,0,0,0.4) 90%,
-        transparent 100%
-      );
-    mask-composite: intersect, intersect;
-  }
-
-  #scroll-video-bg .scroll-media-mask-wrap video,
-  #scroll-video-bg .scroll-media-mask-wrap .hero-static-slide {
-    position: absolute;
-    inset: 0;
+    top: 50%;
+    left: 50%;
+    /* Cover the entire viewport — no letterboxing */
     width: 100%;
     height: 100%;
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
+    min-width: 100%;
+    min-height: 100%;
+    object-fit: cover;
     object-position: center center;
+    transform: translate(-50%, -50%);
     pointer-events: none;
     backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
   }
 
-  #scroll-video-bg .scroll-media-mask-wrap video {
+  /* Correct stacking: image on top while loading, video underneath once ready */
+  #scroll-video-bg video {
     z-index: 0;
     will-change: opacity;
   }
-
-  #scroll-video-bg .scroll-media-mask-wrap .hero-static-slide {
+  #scroll-video-bg .hero-static-slide {
     z-index: 1;
     opacity: 1;
+    transition: opacity 0.6s ease;
   }
 
-  /* Dark overlay over video — varies by scroll */
-  #scroll-video-bg::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(
-      180deg,
-      rgba(4,4,8,0.55) 0%,
-      rgba(4,4,8,0.45) 40%,
-      rgba(4,4,8,0.65) 100%
-    );
-    z-index: 1;
-  }
-
-  /* scanline on top of video */
+  /* ── EDGE VIGNETTE — fades content INTO dark toward all four edges ── */
   #scroll-video-bg::before {
     content: '';
     position: absolute;
     inset: 0;
     z-index: 2;
+    pointer-events: none;
+    background:
+      /* top fade */
+      linear-gradient(180deg,
+        rgba(4,4,8,0.85) 0%,
+        rgba(4,4,8,0.40) 12%,
+        transparent 28%
+      ),
+      /* bottom fade */
+      linear-gradient(0deg,
+        rgba(4,4,8,0.85) 0%,
+        rgba(4,4,8,0.40) 12%,
+        transparent 28%
+      ),
+      /* left fade */
+      linear-gradient(90deg,
+        rgba(4,4,8,0.72) 0%,
+        rgba(4,4,8,0.28) 10%,
+        transparent 22%
+      ),
+      /* right fade */
+      linear-gradient(270deg,
+        rgba(4,4,8,0.72) 0%,
+        rgba(4,4,8,0.28) 10%,
+        transparent 22%
+      );
+  }
+
+  /* ── DARK OVERLAY — adjustable opacity per scroll ── */
+  #scroll-video-bg::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    pointer-events: none;
+    background: linear-gradient(
+      180deg,
+      rgba(4,4,8,0.45) 0%,
+      rgba(4,4,8,0.30) 40%,
+      rgba(4,4,8,0.55) 100%
+    );
+  }
+
+  /* ── SCANLINE OVERLAY ── */
+  #scanline-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
     background: repeating-linear-gradient(
       0deg,
       transparent,
       transparent 3px,
-      rgba(0,0,0,0.07) 3px,
-      rgba(0,0,0,0.07) 4px
+      rgba(0,0,0,0.06) 3px,
+      rgba(0,0,0,0.06) 4px
     );
-    pointer-events: none;
     animation: scanFlicker 0.15s steps(1) infinite;
   }
 
@@ -195,6 +146,18 @@
     50% { opacity: 0.7; }
     99% { opacity: 0.7; }
     100%{ opacity: 1;   }
+  }
+
+  /* ── Mobile: slightly stronger overlay so text stays readable ── */
+  @media (max-width: 768px) {
+    #scroll-video-bg::after {
+      background: linear-gradient(
+        180deg,
+        rgba(4,4,8,0.60) 0%,
+        rgba(4,4,8,0.45) 40%,
+        rgba(4,4,8,0.70) 100%
+      );
+    }
   }
 
   /* ── CURTAIN ── */
@@ -244,7 +207,7 @@
 
   /* ── PARTICLE CANVAS ── */
   #particle-canvas {
-    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    position: fixed; inset: 0; z-index: 5; pointer-events: none;
   }
 
   /* ── CURSOR ── */
@@ -269,12 +232,12 @@
       linear-gradient(var(--grid) 1px, transparent 1px),
       linear-gradient(90deg, var(--grid) 1px, transparent 1px);
     background-size: 60px 60px;
-    pointer-events: none; z-index: 2;
+    pointer-events: none; z-index: 6;
   }
   body::after {
     content: ''; position: fixed; inset: 0;
     background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.10) 2px, rgba(0,0,0,0.10) 4px);
-    pointer-events: none; z-index: 2;
+    pointer-events: none; z-index: 6;
   }
 
   /* ── NAV ── */
@@ -292,11 +255,12 @@
   .nav-links a:hover { color: var(--neon-cyan); }
   .nav-links a:hover::after { transform: scaleX(1); }
 
-  section { position: relative; z-index: 3; }
+  section { position: relative; z-index: 7; }
 
   /* ── HERO ── */
   #hero {
     min-height: 100vh;
+    min-height: 100dvh;
     display: flex; align-items: center;
     padding: 120px 60px 60px;
     position: relative; overflow: hidden;
@@ -470,6 +434,7 @@
     50%      { transform: scaleY(1.3); opacity: 1; }
   }
 
+  /* ── RESPONSIVE ── */
   @media (max-width: 900px) {
     nav { padding: 18px 24px; }
     .nav-links { display: none; }
@@ -482,6 +447,22 @@
     .float-tag { display: none; }
     .footer-bar { flex-direction: column; gap: 10px; text-align: center; }
     .contact-details { flex-direction: column; gap: 24px; }
+  }
+
+  /* ── iOS / iPhone safe-area padding for hero ── */
+  @supports (padding: max(0px)) {
+    #hero {
+      padding-left: max(60px, env(safe-area-inset-left));
+      padding-right: max(60px, env(safe-area-inset-right));
+      padding-bottom: max(60px, env(safe-area-inset-bottom));
+    }
+    @media (max-width: 900px) {
+      #hero {
+        padding-left: max(24px, env(safe-area-inset-left));
+        padding-right: max(24px, env(safe-area-inset-right));
+        padding-bottom: max(60px, env(safe-area-inset-bottom));
+      }
+    }
   }
 </style>
 </head>
@@ -497,34 +478,34 @@
 <!-- SCROLL PROGRESS BAR -->
 <div id="scroll-progress"></div>
 
+<!-- SCANLINE (separate element so it doesn't conflict with video bg pseudo-elements) -->
+<div id="scanline-overlay" aria-hidden="true"></div>
+
 <!-- ══════════════════════════════════════════════
-     SCROLL-DRIVEN VIDEO BACKGROUND
-     Strategy: preload metadata → muted → playsInline
-     rAF loop lerps video.currentTime toward targetTime
-     completely decoupled from scroll events
+     SCROLL-DRIVEN VIDEO BACKGROUND — FULL SCREEN COVER
 ═══════════════════════════════════════════════ -->
-<div id="scroll-video-bg">
-  <div class="scroll-media-mask-wrap" aria-hidden="true">
-    <video
-      id="bg-video"
-      src="upscaled-video.mp4"
-      muted
-      playsinline
-      preload="auto"
-      disablePictureInPicture
-      disableRemotePlayback
-    ></video>
-    <img
-      id="hero-static-slide"
-      class="hero-static-slide"
-      src="ChatGPT_Image_Mar_9__2026__09_27_35_AM.png"
-      alt=""
-      width="1920"
-      height="1080"
-      decoding="async"
-      fetchpriority="high"
-    >
-  </div>
+<div id="scroll-video-bg" aria-hidden="true">
+  <!-- Static hero image — shown until user scrolls past hero -->
+  <img
+    id="hero-static-slide"
+    class="hero-static-slide"
+    src="ChatGPT_Image_Mar_9__2026__09_27_35_AM.png"
+    alt=""
+    width="1920"
+    height="1080"
+    decoding="async"
+    fetchpriority="high"
+  >
+  <!-- Scroll-scrubbed video — sits behind the image -->
+  <video
+    id="bg-video"
+    src="upscaled-video.mp4"
+    muted
+    playsinline
+    preload="auto"
+    disablePictureInPicture
+    disableRemotePlayback
+  ></video>
 </div>
 
 <canvas id="particle-canvas"></canvas>
@@ -719,15 +700,7 @@
 <script>
 /* ════════════════════════════════════════════════════════════════
    SCROLL-DRIVEN VIDEO SCRUBBING
-   ─────────────────────────────────────────────────────────────
-   Smooth scrubbing:
-   • Read window.scrollY inside rAF — avoids 1-frame lag vs scroll events
-   • Do NOT use fastSeek() — it snaps to keyframes → “slideshow” look
-   • Do NOT quantize time to coarse steps — map scroll → seconds directly
-   • Skip seeks only when the value barely changed (saves redundant work)
-   Metrics cached on resize/load (no layout thrash each frame).
 ════════════════════════════════════════════════════════════════ */
-
 (function initScrollVideo() {
   const video = document.getElementById('bg-video');
   if (!video) return;
@@ -735,20 +708,14 @@
   const FALLBACK_DURATION = 5.041667;
   let videoDuration = FALLBACK_DURATION;
   let totalScrollPx = 1;
-  /** Document Y of #skills (Capabilities) top — video scrubs only from here */
   let capabilitiesTop = 0;
-  /** Last time written to the video (skip micro-duplicates only) */
   let lastSeekTime = -999;
-
-  /** Skip only near-identical times (float noise); keep scrub visually continuous */
   const MIN_SEEK_DELTA = 1e-4;
-
-  /** Fade hero image to 0 over this many px of scroll before Capabilities hits */
   const HERO_FADE_PX = 480;
 
   const scrollProgressEl = document.getElementById('scroll-progress');
-  const scrubHintEl = document.getElementById('video-scrub-hint');
-  const heroSlideImg = document.getElementById('hero-static-slide');
+  const scrubHintEl      = document.getElementById('video-scrub-hint');
+  const heroSlideImg     = document.getElementById('hero-static-slide');
 
   function getMaxScroll() {
     return Math.max(
@@ -761,8 +728,7 @@
     totalScrollPx = Math.max(1, getMaxScroll());
     const skills = document.getElementById('skills');
     if (skills) {
-      const r = skills.getBoundingClientRect();
-      capabilitiesTop = r.top + window.scrollY;
+      capabilitiesTop = skills.getBoundingClientRect().top + window.scrollY;
     } else {
       capabilitiesTop = 0;
     }
@@ -781,9 +747,7 @@
     refreshScrollMetrics();
   });
 
-  video.addEventListener('play', () => {
-    video.pause();
-  });
+  video.addEventListener('play', () => { video.pause(); });
 
   function applySeek(seconds) {
     const clamped = Math.min(Math.max(seconds, 0), videoDuration);
@@ -797,20 +761,21 @@
     const cap = capabilitiesTop;
     const fadeStart = Math.max(0, cap - HERO_FADE_PX);
 
+    /* Fade hero image out as user approaches Capabilities section */
     let imgOpacity = 1;
-    if (y >= cap) imgOpacity = 0;
-    else if (y > fadeStart && cap > fadeStart) {
+    if (y >= cap) {
+      imgOpacity = 0;
+    } else if (y > fadeStart && cap > fadeStart) {
       imgOpacity = 1 - (y - fadeStart) / (cap - fadeStart);
     }
-    if (heroSlideImg) {
-      heroSlideImg.style.opacity = String(imgOpacity);
-    }
+    if (heroSlideImg) heroSlideImg.style.opacity = String(imgOpacity);
 
+    /* Scrub video proportionally between Capabilities and bottom of page */
     let targetTime = 0;
     if (y >= cap) {
-      const denom = Math.max(1, totalScrollPx - cap);
+      const denom    = Math.max(1, totalScrollPx - cap);
       const progress = Math.min(Math.max((y - cap) / denom, 0), 1);
-      targetTime = progress * videoDuration;
+      targetTime     = progress * videoDuration;
     }
     applySeek(targetTime);
 
