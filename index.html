@@ -36,21 +36,23 @@
     z-index: 0;
     pointer-events: none;
     overflow: hidden;
+    background: var(--dark);
   }
 
-  #scroll-video-bg video {
+  /* Full viewport box, no extra zoom: contain scales to fit (whole frame visible) */
+  #scroll-video-bg video,
+  #scroll-video-bg > img {
     position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    min-width: 100%;
-    min-height: 100%;
-    width: auto;
-    height: auto;
-    object-fit: cover;
-    /* GPU-accelerated compositing hint */
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    object-position: center center;
     will-change: opacity;
     backface-visibility: hidden;
+    pointer-events: none;
   }
 
   /* Dark overlay over video — varies by scroll */
@@ -602,92 +604,98 @@
 <script>
 /* ════════════════════════════════════════════════════════════════
    SCROLL-DRIVEN VIDEO SCRUBBING
-   ─────────────────────────────────────────────────────────────
-   Core principles for zero-jitter scrubbing:
-   1. NEVER set video.currentTime inside a scroll event handler
-      (scroll fires off rAF cadence → janky seeks)
-   2. Read scrollY in a scroll listener → store as raw number
-   3. In rAF: lerp currentTarget toward raw scroll value,
-      then write video.currentTime only when delta > threshold
-   4. video stays paused (we own time completely)
-   5. promote video layer with will-change:transform so the
-      GPU compositor can move it without re-rasterizing
+   Before Capabilities (#skills): stay on first frame (time = 0).
+   From Capabilities onward: map scroll → full video over rest of page.
+   Read scrollY in rAF; cache metrics on resize/load only.
 ════════════════════════════════════════════════════════════════ */
 
 (function initScrollVideo() {
   const video = document.getElementById('bg-video');
   if (!video) return;
 
-  const VIDEO_DURATION = 5.041667; // seconds — matches actual file
-  // How many px of scroll = full video duration
-  // We stretch it across the whole page so video plays end-to-end
-  // We'll recalculate once DOM is ready
-  let totalScrollPx   = 1;
-  let rawScrollY      = 0;    // latest scroll position (set in scroll event)
-  let smoothScrollY   = 0;    // lerped value used to drive currentTime
-  let lastCurrentTime = -1;   // guard: only seek when changed
+  const FALLBACK_DURATION = 5.041667;
+  let videoDuration = FALLBACK_DURATION;
+  let totalScrollPx = 1;
+  /** Document Y of top of #skills (Capabilities) */
+  let capabilitiesTop = 0;
+  let lastSeekTime = -999;
+  const MIN_SEEK_DELTA = 1e-4;
 
-  // Lerp factor — higher = snappier, lower = silkier trailing
-  // 0.08 gives a nice 80ms-ish lag that feels cinematic
-  const LERP = 0.08;
-  // Only seek if delta > this many seconds (avoids redundant seeks at 60fps)
-  const SEEK_THRESHOLD = 0.001;
+  const scrollProgressEl = document.getElementById('scroll-progress');
+  const scrubHintEl = document.getElementById('video-scrub-hint');
 
-  function getPageHeight() {
+  function getMaxScroll() {
     return Math.max(
       document.body.scrollHeight,
       document.documentElement.scrollHeight
     ) - window.innerHeight;
   }
 
-  // Passive scroll listener — just stores value, no DOM writes
-  window.addEventListener('scroll', () => {
-    rawScrollY = window.scrollY;
-  }, { passive: true });
+  function refreshScrollMetrics() {
+    totalScrollPx = Math.max(1, getMaxScroll());
+    const skills = document.getElementById('skills');
+    if (skills) {
+      const r = skills.getBoundingClientRect();
+      capabilitiesTop = r.top + window.scrollY;
+    } else {
+      capabilitiesTop = 0;
+    }
+  }
 
-  // Ensure video is ready before we start scrubbing
+  window.addEventListener('resize', refreshScrollMetrics);
+  window.addEventListener('orientationchange', refreshScrollMetrics);
+  window.addEventListener('load', refreshScrollMetrics);
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(refreshScrollMetrics);
+  }
+
   video.addEventListener('loadedmetadata', () => {
+    videoDuration = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : FALLBACK_DURATION;
     video.currentTime = 0;
-    video.pause(); // we control time; never let browser play
+    video.pause();
+    refreshScrollMetrics();
   });
 
-  // Also pause any accidental play attempts
   video.addEventListener('play', () => {
     video.pause();
   });
 
-  // rAF loop — the ONLY place we write video.currentTime
-  let rafId;
-  function tick() {
-    totalScrollPx = getPageHeight();
-
-    // Lerp smoothScrollY toward rawScrollY
-    smoothScrollY += (rawScrollY - smoothScrollY) * LERP;
-
-    // Map scroll → [0, VIDEO_DURATION]
-    const progress    = Math.min(Math.max(smoothScrollY / totalScrollPx, 0), 1);
-    const targetTime  = progress * VIDEO_DURATION;
-
-    // Only seek when change is significant enough
-    if (Math.abs(targetTime - lastCurrentTime) > SEEK_THRESHOLD) {
-      video.currentTime = targetTime;
-      lastCurrentTime   = targetTime;
+  function applySeek(seconds) {
+    const clamped = Math.min(Math.max(seconds, 0), videoDuration);
+    if (Math.abs(clamped - lastSeekTime) < MIN_SEEK_DELTA) return;
+    lastSeekTime = clamped;
+    try {
+      video.currentTime = clamped;
+    } catch {
+      /* ignore invalid seeks while buffer is empty */
     }
-
-    // Scroll progress bar
-    const pct = (rawScrollY / totalScrollPx) * 100;
-    document.getElementById('scroll-progress').style.width = pct + '%';
-
-    // Hide scroll hint after first meaningful scroll
-    if (rawScrollY > 80) {
-      document.getElementById('video-scrub-hint').classList.add('hidden');
-    }
-
-    rafId = requestAnimationFrame(tick);
   }
 
-  // Start loop after a short delay to let page render
-  // (avoids fighting curtain animation)
+  function tick() {
+    refreshScrollMetrics();
+    const y = window.scrollY || window.pageYOffset || 0;
+
+    let targetTime = 0;
+    if (y >= capabilitiesTop) {
+      const denom = Math.max(1, totalScrollPx - capabilitiesTop);
+      const progress = Math.min(Math.max((y - capabilitiesTop) / denom, 0), 1);
+      targetTime = progress * videoDuration;
+    }
+    applySeek(targetTime);
+
+    if (scrollProgressEl) {
+      scrollProgressEl.style.width = (y / totalScrollPx) * 100 + '%';
+    }
+    if (scrubHintEl && y > 80) {
+      scrubHintEl.classList.add('hidden');
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  refreshScrollMetrics();
   setTimeout(() => requestAnimationFrame(tick), 600);
 })();
 
