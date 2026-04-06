@@ -383,6 +383,8 @@
     .footer-bar { flex-direction: column; gap: 10px; text-align: center; }
     .contact-details { flex-direction: column; gap: 24px; }
   }
+
+  #fluid { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: block; pointer-events: none; z-index: 50; }
 </style>
 </head>
 <body>
@@ -392,6 +394,8 @@
   <div class="curtain-left"><div class="curtain-logo">JAYAVIGNESH</div></div>
   <div class="curtain-right"><div class="curtain-logo">MURUGAVEL</div></div>
 </div>
+
+<canvas id="fluid"></canvas>
 
 <!-- SCROLL PROGRESS BAR -->
 <div id="scroll-progress"></div>
@@ -604,6 +608,397 @@
 </section>
 
 <script>
+
+(function () {
+  var config = {
+    SIM_RESOLUTION: 128, DYE_RESOLUTION: 1440,
+    DENSITY_DISSIPATION: 3.5, VELOCITY_DISSIPATION: 2,
+    PRESSURE: 0.1, PRESSURE_ITERATIONS: 20,
+    CURL: 3, SPLAT_RADIUS: 0.2, SPLAT_FORCE: 6000,
+    SHADING: true, COLOR_UPDATE_SPEED: 10,
+  };
+ 
+  var canvas = document.getElementById('fluid');
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+ 
+  var params = { alpha: true, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false };
+  var gl = canvas.getContext('webgl2', params) || canvas.getContext('webgl', params);
+  if (!gl) { alert('WebGL not supported'); return; }
+ 
+  var isWebGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+  var ext = {};
+ 
+  if (isWebGL2) {
+    gl.getExtension('EXT_color_buffer_float');
+    ext.supportLinearFiltering = !!gl.getExtension('OES_texture_float_linear');
+    ext.halfFloatTexType = gl.HALF_FLOAT;
+  } else {
+    var hf = gl.getExtension('OES_texture_half_float');
+    ext.supportLinearFiltering = !!gl.getExtension('OES_texture_half_float_linear');
+    ext.halfFloatTexType = hf ? hf.HALF_FLOAT_OES : 0;
+  }
+ 
+  if (!ext.supportLinearFiltering) { config.DYE_RESOLUTION = 256; config.SHADING = false; }
+ 
+  function supportsFormat(iFmt, fmt, type) {
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, iFmt, 4, 4, 0, fmt, type, null);
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  }
+ 
+  function bestFormat(iFmt, fmt, type) {
+    if (supportsFormat(iFmt, fmt, type)) return { internalFormat: iFmt, format: fmt };
+    if (isWebGL2) {
+      if (iFmt === gl.R16F)  return bestFormat(gl.RG16F,   gl.RG,   type);
+      if (iFmt === gl.RG16F) return bestFormat(gl.RGBA16F, gl.RGBA, type);
+    }
+    return null;
+  }
+ 
+  var tt = ext.halfFloatTexType;
+  if (isWebGL2) {
+    ext.formatRGBA = bestFormat(gl.RGBA16F, gl.RGBA, tt);
+    ext.formatRG   = bestFormat(gl.RG16F,   gl.RG,   tt);
+    ext.formatR    = bestFormat(gl.R16F,    gl.RED,  tt);
+  } else {
+    ext.formatRGBA = bestFormat(gl.RGBA, gl.RGBA, tt);
+    ext.formatRG   = bestFormat(gl.RGBA, gl.RGBA, tt);
+    ext.formatR    = bestFormat(gl.RGBA, gl.RGBA, tt);
+  }
+ 
+  gl.clearColor(0, 0, 0, 1);
+ 
+  function compileShader(type, src, keywords) {
+    if (keywords) src = keywords.map(function(k){ return '#define '+k; }).join('\n') + '\n' + src;
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); return null; }
+    return s;
+  }
+ 
+  function makeProgram(vs, fs) {
+    var p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); return null; }
+    var u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (var i = 0; i < n; i++) { var info = gl.getActiveUniform(p, i); if (info) u[info.name] = gl.getUniformLocation(p, info.name); }
+    return { prog: p, u: u };
+  }
+ 
+  var baseVert = compileShader(gl.VERTEX_SHADER, [
+    'precision highp float;',
+    'attribute vec2 aPosition;',
+    'varying vec2 vUv, vL, vR, vT, vB;',
+    'uniform vec2 texelSize;',
+    'void main(){',
+    '  vUv=aPosition*0.5+0.5;',
+    '  vL=vUv-vec2(texelSize.x,0.0); vR=vUv+vec2(texelSize.x,0.0);',
+    '  vT=vUv+vec2(0.0,texelSize.y); vB=vUv-vec2(0.0,texelSize.y);',
+    '  gl_Position=vec4(aPosition,0.0,1.0);',
+    '}'
+  ].join('\n'));
+ 
+  function makeFS(src, kw) { return compileShader(gl.FRAGMENT_SHADER, src, kw); }
+ 
+  var copyProg  = makeProgram(baseVert, makeFS('precision mediump float;precision mediump sampler2D;varying highp vec2 vUv;uniform sampler2D uTexture;void main(){gl_FragColor=texture2D(uTexture,vUv);}'));
+  var clearProg = makeProgram(baseVert, makeFS('precision mediump float;precision mediump sampler2D;varying highp vec2 vUv;uniform sampler2D uTexture;uniform float value;void main(){gl_FragColor=value*texture2D(uTexture,vUv);}'));
+ 
+  var splatProg = makeProgram(baseVert, makeFS([
+    'precision highp float;precision highp sampler2D;',
+    'varying vec2 vUv;uniform sampler2D uTarget;',
+    'uniform float aspectRatio;uniform vec3 color;uniform vec2 point;uniform float radius;',
+    'void main(){vec2 p=vUv-point.xy;p.x*=aspectRatio;',
+    'vec3 splat=exp(-dot(p,p)/radius)*color;',
+    'gl_FragColor=vec4(texture2D(uTarget,vUv).xyz+splat,1.0);}'
+  ].join('\n')));
+ 
+  var advProg = makeProgram(baseVert, makeFS([
+    'precision highp float;precision highp sampler2D;',
+    'varying vec2 vUv;uniform sampler2D uVelocity,uSource;',
+    'uniform vec2 texelSize,dyeTexelSize;uniform float dt,dissipation;',
+    'vec4 bilerp(sampler2D s,vec2 uv,vec2 ts){',
+    '  vec2 st=uv/ts-0.5,iuv=floor(st),fuv=fract(st);',
+    '  vec4 a=texture2D(s,(iuv+vec2(0.5,0.5))*ts);',
+    '  vec4 b=texture2D(s,(iuv+vec2(1.5,0.5))*ts);',
+    '  vec4 c=texture2D(s,(iuv+vec2(0.5,1.5))*ts);',
+    '  vec4 d=texture2D(s,(iuv+vec2(1.5,1.5))*ts);',
+    '  return mix(mix(a,b,fuv.x),mix(c,d,fuv.x),fuv.y);}',
+    'void main(){',
+    '#ifdef MANUAL_FILTERING',
+    '  vec2 coord=vUv-dt*bilerp(uVelocity,vUv,texelSize).xy*texelSize;',
+    '  vec4 result=bilerp(uSource,coord,dyeTexelSize);',
+    '#else',
+    '  vec2 coord=vUv-dt*texture2D(uVelocity,vUv).xy*texelSize;',
+    '  vec4 result=texture2D(uSource,coord);',
+    '#endif',
+    '  gl_FragColor=result/(1.0+dissipation*dt);}',
+  ].join('\n'), ext.supportLinearFiltering ? null : ['MANUAL_FILTERING']));
+ 
+  var divProg = makeProgram(baseVert, makeFS([
+    'precision mediump float;precision mediump sampler2D;',
+    'varying highp vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity;',
+    'void main(){float L=texture2D(uVelocity,vL).x,R=texture2D(uVelocity,vR).x,T=texture2D(uVelocity,vT).y,B=texture2D(uVelocity,vB).y;',
+    'vec2 C=texture2D(uVelocity,vUv).xy;',
+    'if(vL.x<0.0)L=-C.x;if(vR.x>1.0)R=-C.x;if(vT.y>1.0)T=-C.y;if(vB.y<0.0)B=-C.y;',
+    'gl_FragColor=vec4(0.5*(R-L+T-B),0.0,0.0,1.0);}'
+  ].join('\n')));
+ 
+  var curlProg = makeProgram(baseVert, makeFS([
+    'precision mediump float;precision mediump sampler2D;',
+    'varying highp vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity;',
+    'void main(){float L=texture2D(uVelocity,vL).y,R=texture2D(uVelocity,vR).y,T=texture2D(uVelocity,vT).x,B=texture2D(uVelocity,vB).x;',
+    'gl_FragColor=vec4(0.5*(R-L-T+B),0.0,0.0,1.0);}'
+  ].join('\n')));
+ 
+  var vortProg = makeProgram(baseVert, makeFS([
+    'precision highp float;precision highp sampler2D;',
+    'varying vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity,uCurl;uniform float curl,dt;',
+    'void main(){float L=texture2D(uCurl,vL).x,R=texture2D(uCurl,vR).x,T=texture2D(uCurl,vT).x,B=texture2D(uCurl,vB).x,C=texture2D(uCurl,vUv).x;',
+    'vec2 f=0.5*vec2(abs(T)-abs(B),abs(R)-abs(L));f/=length(f)+0.0001;f*=curl*C;f.y*=-1.0;',
+    'vec2 v=texture2D(uVelocity,vUv).xy+f*dt;v=min(max(v,-1000.0),1000.0);',
+    'gl_FragColor=vec4(v,0.0,1.0);}'
+  ].join('\n')));
+ 
+  var presProg = makeProgram(baseVert, makeFS([
+    'precision mediump float;precision mediump sampler2D;',
+    'varying highp vec2 vUv,vL,vR,vT,vB;uniform sampler2D uPressure,uDivergence;',
+    'void main(){float L=texture2D(uPressure,vL).x,R=texture2D(uPressure,vR).x,T=texture2D(uPressure,vT).x,B=texture2D(uPressure,vB).x,d=texture2D(uDivergence,vUv).x;',
+    'gl_FragColor=vec4((L+R+B+T-d)*0.25,0.0,0.0,1.0);}'
+  ].join('\n')));
+ 
+  var gradProg = makeProgram(baseVert, makeFS([
+    'precision mediump float;precision mediump sampler2D;',
+    'varying highp vec2 vUv,vL,vR,vT,vB;uniform sampler2D uPressure,uVelocity;',
+    'void main(){float L=texture2D(uPressure,vL).x,R=texture2D(uPressure,vR).x,T=texture2D(uPressure,vT).x,B=texture2D(uPressure,vB).x;',
+    'vec2 v=texture2D(uVelocity,vUv).xy;v.xy-=vec2(R-L,T-B);',
+    'gl_FragColor=vec4(v,0.0,1.0);}'
+  ].join('\n')));
+ 
+  var displayProgPlain   = makeProgram(baseVert, makeFS([
+    'precision highp float;precision highp sampler2D;',
+    'varying vec2 vUv;uniform sampler2D uTexture;',
+    'void main(){vec3 c=texture2D(uTexture,vUv).rgb;float a=max(c.r,max(c.g,c.b));gl_FragColor=vec4(c,a);}'
+  ].join('\n')));
+ 
+  var displayProgShading = makeProgram(baseVert, makeFS([
+    'precision highp float;precision highp sampler2D;',
+    'varying vec2 vUv,vL,vR,vT,vB;uniform sampler2D uTexture;uniform vec2 texelSize;',
+    'void main(){vec3 c=texture2D(uTexture,vUv).rgb,lc=texture2D(uTexture,vL).rgb,rc=texture2D(uTexture,vR).rgb,tc=texture2D(uTexture,vT).rgb,bc=texture2D(uTexture,vB).rgb;',
+    'float dx=length(rc)-length(lc),dy=length(tc)-length(bc);',
+    'vec3 n=normalize(vec3(dx,dy,length(texelSize)));',
+    'float d=clamp(dot(n,vec3(0,0,1))+0.7,0.7,1.0);c*=d;',
+    'float a=max(c.r,max(c.g,c.b));gl_FragColor=vec4(c,a);}'
+  ].join('\n')));
+ 
+  // Quad
+  var qbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,-1,1,1,1,1,-1]), gl.STATIC_DRAW);
+  var ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2,0,2,3]), gl.STATIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+ 
+  function blit(target, doClear) {
+    if (!target) { gl.viewport(0,0,gl.drawingBufferWidth,gl.drawingBufferHeight); gl.bindFramebuffer(gl.FRAMEBUFFER,null); }
+    else { gl.viewport(0,0,target.width,target.height); gl.bindFramebuffer(gl.FRAMEBUFFER,target.fbo); }
+    if (doClear) { gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT); }
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+ 
+  function createFBO(w, h, iF, f, type, param) {
+    gl.activeTexture(gl.TEXTURE0);
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, param);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, param);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, iF, w, h, 0, f, type, null);
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.viewport(0,0,w,h); gl.clear(gl.COLOR_BUFFER_BIT);
+    return { texture:tex, fbo:fbo, width:w, height:h, texelSizeX:1/w, texelSizeY:1/h,
+      attach:function(id){ gl.activeTexture(gl.TEXTURE0+id); gl.bindTexture(gl.TEXTURE_2D,tex); return id; } };
+  }
+ 
+  function createDFBO(w,h,iF,f,type,param) {
+    var a=createFBO(w,h,iF,f,type,param), b=createFBO(w,h,iF,f,type,param);
+    return { width:w,height:h,texelSizeX:a.texelSizeX,texelSizeY:a.texelSizeY,read:a,write:b,
+      swap:function(){ var t=this.read;this.read=this.write;this.write=t; } };
+  }
+ 
+  var dye, velocity, divFBO, curlFBO, presFBO;
+ 
+  function getRes(res) {
+    var w=gl.drawingBufferWidth, h=gl.drawingBufferHeight, ar=w/h;
+    var aspect=ar<1?1/ar:ar, mn=Math.round(res), mx=Math.round(res*aspect);
+    return w>h?{width:mx,height:mn}:{width:mn,height:mx};
+  }
+ 
+  function initFBOs() {
+    var s=getRes(config.SIM_RESOLUTION), d=getRes(config.DYE_RESOLUTION);
+    var t=ext.halfFloatTexType, fil=ext.supportLinearFiltering?gl.LINEAR:gl.NEAREST;
+    var rgba=ext.formatRGBA, rg=ext.formatRG, r=ext.formatR;
+    gl.disable(gl.BLEND);
+    dye      = createDFBO(d.width,d.height,rgba.internalFormat,rgba.format,t,fil);
+    velocity = createDFBO(s.width,s.height,rg.internalFormat,rg.format,t,fil);
+    divFBO   = createFBO(s.width,s.height,r.internalFormat,r.format,t,gl.NEAREST);
+    curlFBO  = createFBO(s.width,s.height,r.internalFormat,r.format,t,gl.NEAREST);
+    presFBO  = createDFBO(s.width,s.height,r.internalFormat,r.format,t,gl.NEAREST);
+  }
+ 
+  initFBOs();
+ 
+  function HSVtoRGB(h,s,v) {
+    var r,g,b,i=Math.floor(h*6),f=h*6-i,p=v*(1-s),q=v*(1-f*s),t2=v*(1-(1-f)*s);
+    switch(i%6){case 0:r=v;g=t2;b=p;break;case 1:r=q;g=v;b=p;break;case 2:r=p;g=v;b=t2;break;
+      case 3:r=p;g=q;b=v;break;case 4:r=t2;g=p;b=v;break;case 5:r=v;g=p;b=q;break;}
+    return {r:r,g:g,b:b};
+  }
+  function generateColor(){ var c=HSVtoRGB(Math.random(),1,1); return {r:c.r*0.15,g:c.g*0.15,b:c.b*0.15}; }
+  function scaleByDPR(v){ return Math.floor(v*(window.devicePixelRatio||1)); }
+  function correctRadius(r){ var ar=canvas.width/canvas.height; if(ar>1)r*=ar; return r; }
+  function correctDX(d){ var ar=canvas.width/canvas.height; if(ar<1)d*=ar; return d; }
+  function correctDY(d){ var ar=canvas.width/canvas.height; if(ar>1)d/=ar; return d; }
+ 
+  var ptr = { texcoordX:0,texcoordY:0,prevTexcoordX:0,prevTexcoordY:0,deltaX:0,deltaY:0,moved:false,color:{r:0,g:0,b:0} };
+ 
+  function updateMove(posX,posY,color){
+    ptr.prevTexcoordX=ptr.texcoordX; ptr.prevTexcoordY=ptr.texcoordY;
+    ptr.texcoordX=posX/canvas.width; ptr.texcoordY=1-posY/canvas.height;
+    ptr.deltaX=correctDX(ptr.texcoordX-ptr.prevTexcoordX);
+    ptr.deltaY=correctDY(ptr.texcoordY-ptr.prevTexcoordY);
+    ptr.moved=Math.abs(ptr.deltaX)>0||Math.abs(ptr.deltaY)>0;
+    ptr.color=color;
+  }
+ 
+  function splat(x,y,dx,dy,color){
+    gl.useProgram(splatProg.prog);
+    gl.uniform1i(splatProg.u.uTarget, velocity.read.attach(0));
+    gl.uniform1f(splatProg.u.aspectRatio, canvas.width/canvas.height);
+    gl.uniform2f(splatProg.u.point, x, y);
+    gl.uniform3f(splatProg.u.color, dx, dy, 0);
+    gl.uniform1f(splatProg.u.radius, correctRadius(config.SPLAT_RADIUS/100));
+    blit(velocity.write); velocity.swap();
+    gl.uniform1i(splatProg.u.uTarget, dye.read.attach(0));
+    gl.uniform3f(splatProg.u.color, color.r, color.g, color.b);
+    blit(dye.write); dye.swap();
+  }
+ 
+  function splatPtr(){ splat(ptr.texcoordX,ptr.texcoordY,ptr.deltaX*config.SPLAT_FORCE,ptr.deltaY*config.SPLAT_FORCE,ptr.color); }
+  function clickSplat(){ var c=generateColor();c.r*=10;c.g*=10;c.b*=10;splat(ptr.texcoordX,ptr.texcoordY,10*(Math.random()-0.5),30*(Math.random()-0.5),c); }
+ 
+  function step(dt){
+    gl.disable(gl.BLEND);
+    gl.useProgram(curlProg.prog);
+    gl.uniform2f(curlProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    gl.uniform1i(curlProg.u.uVelocity,velocity.read.attach(0));
+    blit(curlFBO);
+ 
+    gl.useProgram(vortProg.prog);
+    gl.uniform2f(vortProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    gl.uniform1i(vortProg.u.uVelocity,velocity.read.attach(0));
+    gl.uniform1i(vortProg.u.uCurl,curlFBO.attach(1));
+    gl.uniform1f(vortProg.u.curl,config.CURL);
+    gl.uniform1f(vortProg.u.dt,dt);
+    blit(velocity.write); velocity.swap();
+ 
+    gl.useProgram(divProg.prog);
+    gl.uniform2f(divProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    gl.uniform1i(divProg.u.uVelocity,velocity.read.attach(0));
+    blit(divFBO);
+ 
+    gl.useProgram(clearProg.prog);
+    gl.uniform1i(clearProg.u.uTexture,presFBO.read.attach(0));
+    gl.uniform1f(clearProg.u.value,config.PRESSURE);
+    blit(presFBO.write); presFBO.swap();
+ 
+    gl.useProgram(presProg.prog);
+    gl.uniform2f(presProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    gl.uniform1i(presProg.u.uDivergence,divFBO.attach(0));
+    for(var i=0;i<config.PRESSURE_ITERATIONS;i++){ gl.uniform1i(presProg.u.uPressure,presFBO.read.attach(1)); blit(presFBO.write); presFBO.swap(); }
+ 
+    gl.useProgram(gradProg.prog);
+    gl.uniform2f(gradProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    gl.uniform1i(gradProg.u.uPressure,presFBO.read.attach(0));
+    gl.uniform1i(gradProg.u.uVelocity,velocity.read.attach(1));
+    blit(velocity.write); velocity.swap();
+ 
+    gl.useProgram(advProg.prog);
+    gl.uniform2f(advProg.u.texelSize,velocity.texelSizeX,velocity.texelSizeY);
+    if(!ext.supportLinearFiltering) gl.uniform2f(advProg.u.dyeTexelSize,velocity.texelSizeX,velocity.texelSizeY);
+    var vid=velocity.read.attach(0);
+    gl.uniform1i(advProg.u.uVelocity,vid); gl.uniform1i(advProg.u.uSource,vid);
+    gl.uniform1f(advProg.u.dt,dt); gl.uniform1f(advProg.u.dissipation,config.VELOCITY_DISSIPATION);
+    blit(velocity.write); velocity.swap();
+ 
+    if(!ext.supportLinearFiltering) gl.uniform2f(advProg.u.dyeTexelSize,dye.texelSizeX,dye.texelSizeY);
+    gl.uniform1i(advProg.u.uVelocity,velocity.read.attach(0));
+    gl.uniform1i(advProg.u.uSource,dye.read.attach(1));
+    gl.uniform1f(advProg.u.dissipation,config.DENSITY_DISSIPATION);
+    blit(dye.write); dye.swap();
+  }
+ 
+  function render(){
+    gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.enable(gl.BLEND);
+    var dp=config.SHADING?displayProgShading:displayProgPlain;
+    gl.useProgram(dp.prog);
+    if(config.SHADING) gl.uniform2f(dp.u.texelSize,1/gl.drawingBufferWidth,1/gl.drawingBufferHeight);
+    gl.uniform1i(dp.u.uTexture,dye.read.attach(0));
+    blit(null,false);
+  }
+ 
+  var lastTime=Date.now(), colorTimer=0, started=false;
+ 
+  function loop(){
+    var now=Date.now(), dt=Math.min((now-lastTime)/1000,0.016666);
+    lastTime=now;
+    var W=scaleByDPR(canvas.clientWidth), H=scaleByDPR(canvas.clientHeight);
+    if(canvas.width!==W||canvas.height!==H){ canvas.width=W; canvas.height=H; initFBOs(); }
+    colorTimer+=dt*config.COLOR_UPDATE_SPEED;
+    if(colorTimer>=1){ colorTimer=colorTimer%1; ptr.color=generateColor(); }
+    if(ptr.moved){ ptr.moved=false; splatPtr(); }
+    step(dt); render();
+    requestAnimationFrame(loop);
+  }
+ 
+  window.addEventListener('mousedown',function(e){
+    ptr.texcoordX=scaleByDPR(e.clientX)/canvas.width;
+    ptr.texcoordY=1-scaleByDPR(e.clientY)/canvas.height;
+    ptr.color=generateColor(); clickSplat();
+  });
+  window.addEventListener('mousemove',function(e){
+    updateMove(scaleByDPR(e.clientX),scaleByDPR(e.clientY),ptr.color);
+    if(!started){started=true;loop();}
+  });
+  window.addEventListener('touchstart',function(e){
+    var t=e.targetTouches[0];
+    ptr.texcoordX=scaleByDPR(t.clientX)/canvas.width;
+    ptr.texcoordY=1-scaleByDPR(t.clientY)/canvas.height;
+    ptr.color=generateColor(); clickSplat();
+    if(!started){started=true;loop();}
+  },false);
+  window.addEventListener('touchmove',function(e){
+    var t=e.targetTouches[0];
+    updateMove(scaleByDPR(t.clientX),scaleByDPR(t.clientY),ptr.color);
+  },false);
+  window.addEventListener('resize',function(){
+    canvas.width=window.innerWidth; canvas.height=window.innerHeight;
+  });
+})();
+  
 /* ════════════════════════════════════════════════════════════════
    SCROLL-DRIVEN VIDEO SCRUBBING
    Before Capabilities (#skills): stay on first frame (time = 0).
