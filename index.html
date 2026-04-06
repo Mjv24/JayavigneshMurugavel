@@ -389,7 +389,7 @@
 <div class="curtain">
   <div class="curtain-left"><div class="curtain-logo">JAYAVIGNESH</div></div>
   <div class="curtain-right"><div class="curtain-logo">MURUGAVEL</div></div>
-  <!--<div class="curtain-logo">//</div>-->
+  <div class="curtain-logo">//</div>
 </div>
 
 <!-- SCROLL PROGRESS BAR -->
@@ -402,15 +402,17 @@
      completely decoupled from scroll events
 ═══════════════════════════════════════════════ -->
 <div id="scroll-video-bg">
-  <video
-    id="bg-video"
-    src="upscaled-video.mp4"
-    muted
-    playsinline
-    preload="auto"
-    disablePictureInPicture
-    disableRemotePlayback
-  ></video>
+ <!-- REPLACE your existing <video> tag with this -->
+<video
+  id="bg-video"
+  src="upscaled-video.mp4"
+  type="video/mp4"
+  muted
+  playsinline
+  preload="auto"
+  disablePictureInPicture
+  disableRemotePlayback
+></video>
 </div>
 
 <canvas id="particle-canvas"></canvas>
@@ -610,112 +612,392 @@
    Read scrollY in rAF; cache metrics on resize/load only.
 ════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════
+   SCROLL-DRIVEN VIDEO SCRUBBING  —  Chrome/Android/Windows fix
+   Key changes:
+   1. Seek gating via "seeked" event (no queue backpressure)
+   2. MIN_SEEK_DELTA = 0.05s  (skip imperceptible micro-seeks)
+   3. refreshScrollMetrics() only on resize/scroll/load (not rAF)
+   4. force video.load() to pre-buffer on Android
+══════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════
+   SCROLL-DRIVEN VIDEO — CROSS-BROWSER SMOOTH
+   Strategy:
+     iOS Safari  → native video.currentTime seek (hardware accelerated)
+     Chrome/Android/Windows → pre-decode all frames into ImageBitmap[]
+                               then scroll = canvas.drawImage(frames[i])
+                               Zero seek cost. GPU blit only.
+   Fallback: if pre-decode fails/times out → seeked-event-gated seek
+════════════════════════════════════════════════════════════════ */
+
 (function initScrollVideo() {
-  const video = document.getElementById('bg-video');
-  if (!video) return;
 
+  /* ── Config ─────────────────────────────────────────────── */
+  const VIDEO_SRC        = 'upscaled-video.mp4';
   const FALLBACK_DURATION = 5.041667;
-  let videoDuration = FALLBACK_DURATION;
-  let totalScrollPx = 1;
-  /** Document Y of top of #skills (Capabilities) */
-  let capabilitiesTop = 0;
-  /** Document Y of top of #contact — video zoom 0→20% from here to max scroll */
-  let contactSectionTop = 0;
-  let lastSeekTime = -999;
-  const MIN_SEEK_DELTA = 1e-4;
+  const CANVAS_FPS        = 24;     // frames to extract per second
+  const PRELOAD_TIMEOUT   = 12000;  // ms before giving up on pre-decode
+  const MIN_SEEK_DELTA    = 0.05;   // seconds (only used in seek-fallback path)
+  const ZOOM_LAST_SLIDE   = 0.2;
 
+  /* ── DOM refs ───────────────────────────────────────────── */
+  const videoEl          = document.getElementById('bg-video');
   const scrollProgressEl = document.getElementById('scroll-progress');
-  const scrubHintEl = document.getElementById('video-scrub-hint');
+  const scrubHintEl      = document.getElementById('video-scrub-hint');
+  if (!videoEl) return;
 
-  function getMaxScroll() {
-    return Math.max(
-      document.body.scrollHeight,
-      document.documentElement.scrollHeight
-    ) - window.innerHeight;
-  }
+  /* ── Browser detection ──────────────────────────────────── */
+  // iOS Safari has hardware-accelerated scrubbing — use native seek there.
+  // Chrome, Edge, Samsung, Firefox → use canvas path.
+  const IS_IOS_SAFARI = /iP(hone|ad|od)/.test(navigator.userAgent) &&
+                        /WebKit/.test(navigator.userAgent) &&
+                        !/CriOS/.test(navigator.userAgent);  // exclude Chrome on iOS
+
+  /* ── Scroll metrics (cached, updated on events only) ───── */
+  let totalScrollPx     = 1;
+  let capabilitiesTop   = 0;
+  let contactSectionTop = 0;
 
   function refreshScrollMetrics() {
-    totalScrollPx = Math.max(1, getMaxScroll());
+    totalScrollPx = Math.max(1,
+      Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+      - window.innerHeight
+    );
     const skills = document.getElementById('skills');
-    if (skills) {
-      const r = skills.getBoundingClientRect();
-      capabilitiesTop = r.top + window.scrollY;
-    } else {
-      capabilitiesTop = 0;
-    }
+    if (skills) capabilitiesTop = skills.getBoundingClientRect().top + window.scrollY;
     const contact = document.getElementById('contact');
-    if (contact) {
-      const cr = contact.getBoundingClientRect();
-      contactSectionTop = cr.top + window.scrollY;
-    } else {
-      contactSectionTop = totalScrollPx;
-    }
+    contactSectionTop = contact
+      ? contact.getBoundingClientRect().top + window.scrollY
+      : totalScrollPx;
   }
 
-  window.addEventListener('resize', refreshScrollMetrics);
+  window.addEventListener('resize',            refreshScrollMetrics);
   window.addEventListener('orientationchange', refreshScrollMetrics);
-  window.addEventListener('load', refreshScrollMetrics);
-  if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(refreshScrollMetrics);
+  window.addEventListener('scroll',            refreshScrollMetrics, { passive: true });
+  window.addEventListener('load',              refreshScrollMetrics);
+  if (document.fonts?.ready) document.fonts.ready.then(refreshScrollMetrics);
+
+  /* ════════════════════════════════════════════════════════
+     PATH A — iOS Safari: native seek (hardware accelerated)
+  ════════════════════════════════════════════════════════ */
+  if (IS_IOS_SAFARI) {
+    let videoDuration = FALLBACK_DURATION;
+    let lastSeekTime  = -999;
+    let seekPending   = false;
+    let pendingTime   = 0;
+
+    videoEl.addEventListener('loadedmetadata', () => {
+      videoDuration = (Number.isFinite(videoEl.duration) && videoEl.duration > 0)
+        ? videoEl.duration : FALLBACK_DURATION;
+      videoEl.currentTime = 0;
+      videoEl.pause();
+      refreshScrollMetrics();
+    });
+    videoEl.addEventListener('play', () => videoEl.pause());
+
+    videoEl.addEventListener('seeked', () => {
+      seekPending = false;
+      if (Math.abs(pendingTime - lastSeekTime) >= MIN_SEEK_DELTA) doSeekNative(pendingTime);
+    });
+
+    function doSeekNative(s) {
+      const c = Math.min(Math.max(s, 0), videoDuration);
+      if (seekPending) { pendingTime = c; return; }
+      if (Math.abs(c - lastSeekTime) < MIN_SEEK_DELTA) return;
+      seekPending = true; lastSeekTime = c; pendingTime = c;
+      try { videoEl.currentTime = c; } catch { seekPending = false; }
+    }
+
+    videoEl.load();
+
+    function tickNative() {
+      const y = window.scrollY || 0;
+      let t = 0;
+      if (y >= capabilitiesTop) {
+        const prog = Math.min(Math.max((y - capabilitiesTop) / Math.max(1, totalScrollPx - capabilitiesTop), 0), 1);
+        t = prog * videoDuration;
+      }
+      doSeekNative(t);
+      applyZoomAndUI(y);
+      requestAnimationFrame(tickNative);
+    }
+    refreshScrollMetrics();
+    setTimeout(() => requestAnimationFrame(tickNative), 600);
+    return; // done for iOS Safari
   }
 
-  video.addEventListener('loadedmetadata', () => {
-    videoDuration = Number.isFinite(video.duration) && video.duration > 0
-      ? video.duration
-      : FALLBACK_DURATION;
-    video.currentTime = 0;
-    video.pause();
-    refreshScrollMetrics();
-  });
+  /* ════════════════════════════════════════════════════════
+     PATH B — Chrome / Android / Windows: canvas frame cache
+  ════════════════════════════════════════════════════════ */
 
-  video.addEventListener('play', () => {
-    video.pause();
-  });
+  /* Inject a <canvas> overlay that sits exactly over the video */
+  const canvasEl = document.createElement('canvas');
+  canvasEl.id = 'bg-canvas';
+  canvasEl.style.cssText = [
+    'position:absolute', 'inset:0', 'width:100%', 'height:100%',
+    'object-fit:cover', 'object-position:center center',
+    'will-change:transform', 'backface-visibility:hidden',
+    'pointer-events:none', 'display:none'  // hidden until frames ready
+  ].join(';');
+  videoEl.parentNode.insertBefore(canvasEl, videoEl.nextSibling);
+  const canvasCtx = canvasEl.getContext('2d');
 
-  function applySeek(seconds) {
-    const clamped = Math.min(Math.max(seconds, 0), videoDuration);
-    if (Math.abs(clamped - lastSeekTime) < MIN_SEEK_DELTA) return;
-    lastSeekTime = clamped;
-    try {
-      video.currentTime = clamped;
-    } catch {
-      /* ignore invalid seeks while buffer is empty */
-    }
+  /* Loading overlay */
+  const loadOverlay = document.createElement('div');
+  loadOverlay.id = 'video-load-overlay';
+  loadOverlay.style.cssText = [
+    'position:absolute', 'inset:0', 'z-index:3',
+    'display:flex', 'align-items:center', 'justify-content:center',
+    'flex-direction:column', 'gap:12px', 'pointer-events:none'
+  ].join(';');
+  loadOverlay.innerHTML = `
+    <div id="vlo-bar-wrap" style="width:160px;height:2px;background:rgba(0,245,255,0.15);border-radius:2px;overflow:hidden;">
+      <div id="vlo-bar" style="height:100%;width:0%;background:#00f5ff;transition:width 0.2s;border-radius:2px;"></div>
+    </div>
+    <div id="vlo-text" style="font-family:'Orbitron',sans-serif;font-size:0.5rem;letter-spacing:3px;color:rgba(0,245,255,0.4);text-transform:uppercase;">
+      Initialising
+    </div>`;
+  videoEl.parentNode.appendChild(loadOverlay);
+
+  const vloBar  = document.getElementById('vlo-bar');
+  const vloText = document.getElementById('vlo-text');
+
+  function setLoadProgress(pct, label) {
+    if (vloBar)  vloBar.style.width  = pct + '%';
+    if (vloText) vloText.textContent = label;
+  }
+  function hideLoadOverlay() {
+    loadOverlay.style.transition = 'opacity 0.6s';
+    loadOverlay.style.opacity    = '0';
+    setTimeout(() => loadOverlay.remove(), 700);
   }
 
-  function tick() {
-    refreshScrollMetrics();
-    const y = window.scrollY || window.pageYOffset || 0;
+  /* ── Frame store ────────────────────────────────────────── */
+  let frames        = [];       // ImageBitmap[]
+  let framesReady   = false;
+  let videoDuration = FALLBACK_DURATION;
+  let currentCanvasScale = 1;
 
-    let targetTime = 0;
-    if (y >= capabilitiesTop) {
-      const denom = Math.max(1, totalScrollPx - capabilitiesTop);
-      const progress = Math.min(Math.max((y - capabilitiesTop) / denom, 0), 1);
-      targetTime = progress * videoDuration;
+  /* Size canvas to match display */
+  function sizeCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvasEl.width  = window.innerWidth  * dpr;
+    canvasEl.height = window.innerHeight * dpr;
+    canvasEl.style.width  = '100%';
+    canvasEl.style.height = '100%';
+    // Re-draw current frame after resize
+    if (framesReady && frames.length) {
+      paintFrame(currentFrameIndex, currentCanvasScale);
     }
-    applySeek(targetTime);
+  }
+  window.addEventListener('resize', sizeCanvas);
 
-    const ZOOM_LAST_SLIDE = 0.2;
-    let videoScale = 1;
+  /* Paint a specific frame index */
+  let currentFrameIndex = 0;
+  function paintFrame(idx, scale) {
+    currentFrameIndex = idx;
+    currentCanvasScale = scale;
+    if (!frames[idx]) return;
+    const cw = canvasEl.width, ch = canvasEl.height;
+    const fw = frames[idx].width,  fh = frames[idx].height;
+    const ratio = Math.max(cw / fw, ch / fh) * scale;
+    const dw = fw * ratio, dh = fh * ratio;
+    const dx = (cw - dw) / 2,  dy = (ch - dh) / 2;
+    canvasCtx.clearRect(0, 0, cw, ch);
+    canvasCtx.drawImage(frames[idx], dx, dy, dw, dh);
+  }
+
+  /* ── Pre-decode: play video silently, grab frames ───────── */
+  function preDecodeFrames(duration) {
+    return new Promise((resolve, reject) => {
+      const totalFrames = Math.ceil(duration * CANVAS_FPS);
+      const tempVideo   = document.createElement('video');
+      tempVideo.src           = VIDEO_SRC;
+      tempVideo.muted         = true;
+      tempVideo.playsInline   = true;
+      tempVideo.preload       = 'auto';
+      tempVideo.style.cssText = 'position:absolute;visibility:hidden;width:1px;height:1px;top:-9999px;';
+      document.body.appendChild(tempVideo);
+
+      const captured = [];
+      let   frameIdx = 0;
+      let   done     = false;
+
+      const timer = setTimeout(() => {
+        if (!done) { done = true; tempVideo.remove(); reject(new Error('timeout')); }
+      }, PRELOAD_TIMEOUT);
+
+      tempVideo.addEventListener('loadedmetadata', () => {
+        const actualDuration = tempVideo.duration || duration;
+        seekNextFrame();
+
+        function seekNextFrame() {
+          if (done) return;
+          if (frameIdx >= totalFrames) {
+            done = true;
+            clearTimeout(timer);
+            tempVideo.remove();
+            resolve(captured);
+            return;
+          }
+          const t = (frameIdx / totalFrames) * actualDuration;
+          tempVideo.currentTime = t;
+        }
+
+        tempVideo.addEventListener('seeked', () => {
+          if (done) return;
+          // Snapshot this frame
+          const offscreen = document.createElement('canvas');
+          // Capture at half resolution to save memory
+          const scale = 0.5;
+          offscreen.width  = Math.round(tempVideo.videoWidth  * scale) || 960;
+          offscreen.height = Math.round(tempVideo.videoHeight * scale) || 540;
+          const oc = offscreen.getContext('2d');
+          oc.drawImage(tempVideo, 0, 0, offscreen.width, offscreen.height);
+
+          createImageBitmap(offscreen).then(bmp => {
+            captured[frameIdx] = bmp;
+            frameIdx++;
+            const pct = Math.round((frameIdx / totalFrames) * 100);
+            setLoadProgress(pct, `Loading ${pct}%`);
+            seekNextFrame();
+          }).catch(() => {
+            // ImageBitmap failed — store null, will be skipped
+            captured[frameIdx] = null;
+            frameIdx++;
+            seekNextFrame();
+          });
+        });
+      });
+
+      tempVideo.addEventListener('error', () => {
+        if (!done) { done = true; clearTimeout(timer); tempVideo.remove(); reject(new Error('video error')); }
+      });
+
+      tempVideo.load();
+    });
+  }
+
+  /* ── Fallback: seeked-event-gated seek ──────────────────── */
+  /* Used if pre-decode fails or times out */
+  let seekPending = false;
+  let pendingTime = 0;
+  let lastSeekTime = -999;
+
+  videoEl.addEventListener('seeked', () => {
+    seekPending = false;
+    if (Math.abs(pendingTime - lastSeekTime) >= MIN_SEEK_DELTA) doSeekFallback(pendingTime);
+  });
+
+  function doSeekFallback(s) {
+    const c = Math.min(Math.max(s, 0), videoDuration);
+    if (seekPending) { pendingTime = c; return; }
+    if (Math.abs(c - lastSeekTime) < MIN_SEEK_DELTA) return;
+    seekPending = true; lastSeekTime = c; pendingTime = c;
+    try { videoEl.currentTime = c; } catch { seekPending = false; }
+  }
+
+  videoEl.addEventListener('play', () => videoEl.pause());
+
+  /* ── Shared: zoom + UI updates ──────────────────────────── */
+  function applyZoomAndUI(y) {
+    let scale = 1;
     if (y >= contactSectionTop) {
-      const zoomSpan = Math.max(1, totalScrollPx - contactSectionTop);
-      const zoomT = Math.min(Math.max((y - contactSectionTop) / zoomSpan, 0), 1);
-      videoScale = 1 + ZOOM_LAST_SLIDE * zoomT;
+      const span = Math.max(1, totalScrollPx - contactSectionTop);
+      scale = 1 + ZOOM_LAST_SLIDE * Math.min(Math.max((y - contactSectionTop) / span, 0), 1);
     }
-    video.style.transform = `scale(${videoScale})`;
-
-    if (scrollProgressEl) {
+    // Apply zoom to whichever layer is visible
+    if (framesReady) {
+      paintFrame(currentFrameIndex, scale);
+    } else {
+      videoEl.style.transform = `scale(${scale})`;
+    }
+    if (scrollProgressEl)
       scrollProgressEl.style.width = (y / totalScrollPx) * 100 + '%';
-    }
-    if (scrubHintEl && y > 80) {
+    if (scrubHintEl && y > 80)
       scrubHintEl.classList.add('hidden');
+  }
+
+  /* ── rAF tick ───────────────────────────────────────────── */
+  function tick() {
+    const y = window.scrollY || 0;
+    let targetProgress = 0;
+    if (y >= capabilitiesTop) {
+      targetProgress = Math.min(Math.max(
+        (y - capabilitiesTop) / Math.max(1, totalScrollPx - capabilitiesTop), 0), 1);
     }
+
+    let zoomScale = 1;
+    if (y >= contactSectionTop) {
+      const span = Math.max(1, totalScrollPx - contactSectionTop);
+      zoomScale = 1 + ZOOM_LAST_SLIDE * Math.min(Math.max((y - contactSectionTop) / span, 0), 1);
+    }
+
+    if (framesReady && frames.length) {
+      const idx = Math.min(Math.floor(targetProgress * frames.length), frames.length - 1);
+      if (idx !== currentFrameIndex || zoomScale !== currentCanvasScale) {
+        paintFrame(idx, zoomScale);
+      }
+    } else {
+      // Fallback seek path
+      const targetTime = targetProgress * videoDuration;
+      doSeekFallback(targetTime);
+      videoEl.style.transform = `scale(${zoomScale})`;
+    }
+
+    if (scrollProgressEl)
+      scrollProgressEl.style.width = (y / totalScrollPx) * 100 + '%';
+    if (scrubHintEl && y > 80)
+      scrubHintEl.classList.add('hidden');
 
     requestAnimationFrame(tick);
   }
 
-  refreshScrollMetrics();
-  setTimeout(() => requestAnimationFrame(tick), 600);
+  /* ── Boot sequence ──────────────────────────────────────── */
+  async function boot() {
+    refreshScrollMetrics();
+
+    // Get duration first
+    await new Promise(res => {
+      if (videoEl.readyState >= 1) {
+        videoDuration = videoEl.duration || FALLBACK_DURATION;
+        res();
+      } else {
+        videoEl.addEventListener('loadedmetadata', () => {
+          videoDuration = videoEl.duration || FALLBACK_DURATION;
+          videoEl.currentTime = 0;
+          videoEl.pause();
+          res();
+        }, { once: true });
+        videoEl.load();
+      }
+    });
+
+    setLoadProgress(0, 'Preparing');
+
+    try {
+      frames = await preDecodeFrames(videoDuration);
+      framesReady = true;
+      sizeCanvas();
+
+      // Switch from video to canvas
+      videoEl.style.display  = 'none';
+      canvasEl.style.display = 'block';
+      hideLoadOverlay();
+
+    } catch (err) {
+      // Pre-decode failed — fall back to seek path
+      console.warn('[ScrollVideo] Pre-decode failed, using seek fallback:', err.message);
+      hideLoadOverlay();
+      videoEl.style.display = 'block';
+    }
+
+    refreshScrollMetrics();
+    requestAnimationFrame(tick);
+  }
+
+  boot();
+
 })();
 
 
